@@ -1,150 +1,167 @@
 #!/usr/bin/env python3
-"""btc-cent-forecast-01: forecast Bitcoin's price 240 minutes after a checkpoint.
+"""BTC 4-hour-ahead forecaster for make.fun btc-cent-forecast-01.
 
-A small, deterministic, standard-library-only forecaster. It reads one case file
-per run (/input/<id>.in, or $MAKEFUN_INPUT_DIR) holding 4,320 one-minute closes
-of BTC/USDC over the 72 hours up to a checkpoint, and writes /output/<id>.out
-(or $MAKEFUN_OUTPUT_DIR) with exactly {"forecasts": [{"case": <id>, "price": <n>}]}.
+Ensemble of two mean-reversion views of the last 72 hours of 1-minute
+closes, blended and clipped in log space:
 
-The model
-----------
-Work in log-price space. Let p be the checkpoint close (the last price in the
-case), r60 the 60-minute log return, dev24 the log deviation of p from its
-24-hour mean log price, and dev4 the same against its 4-hour mean log price.
-The predicted 240-minute log return is
+  1. A ridge regression on seven log-return / deviation features
+     (returns over 1h/4h/12h/24h and deviations from the 12h/24h/72h
+     mean log price), standardised with constants fitted on 40
+     hourly checkpoints cut from the practice window
+     (2026-11-07..2026-11-11) and regularised (lambda = 10).
+  2. A small hand-damped mean-reversion combo on the 4h return,
+     the 24h return and the deviation from the 24h mean.
 
-    pred = 0.20 * r60 - 0.25 * dev24 - 0.10 * dev4
+Final log-return forecast = clip(0.7 * ridge + 0.3 * combo, +/-0.006),
+so the guess never strays more than ~0.6% (~$450 at $75k) from the
+checkpoint close.  The clip and the 0.7/0.3 blend were chosen because
+they gave the most balanced error across three disjoint evaluations
+on the practice window: 40 hourly checkpoints, 12 earlier 4-hourly
+checkpoints, and the five practice cases whose targets are known
+(p00-p04, recovered from the next case's checkpoint close).
 
-i.e. a blend of short-horizon momentum continuation (the last hour's drift
-persists a little) and mean reversion toward the 24h / 4h averages (the pool
-price in RULES.txt is a single Orca Whirlpool quote, so large-trade excursions
-fade). The weights were chosen by grid search on the six practice cases:
-walk-forward over the practice window (80 checkpoints, every 30 min) and the
-five practice cases whose targets are recoverable from the later cases.
-The chosen weights beat the persistence baseline on both sets
-(walk-forward MAE $366.60 vs $407.79; practice MAE $452.89 vs $470.55).
+Measured on the practice window (see README.md for the full table):
+  persistence baseline  $437.89 / $418.94 / $470.55
+  this ensemble         $319.66 / $388.31 / $347.81
+  (hourly backtest / earlier 4-hourly / practice p00-p04, MAE in USD;
+  the p00-p04 figure is the program's own output, run twice with
+  byte-identical results. p05's target minute, 2026-11-11T06:00Z, lies
+  outside the kit's practice window, so its error cannot be measured
+  locally.)
 
-The prediction is clipped to +/-1.5 times the realised 240-minute volatility
-(per-minute log-return standard deviation over the last 240 minutes, scaled by
-sqrt(240)), a safety valve that never bound on the practice window but caps
-the damage if the final window turns wild. The forecast is p * exp(pred),
-rounded to the price grid's 5 decimals and clamped inside (0, 10,000,000).
-
-Determinism: fixed-order float arithmetic only, no randomness, no time, no
-network, no files besides the case inputs. Two runs produce byte-identical
-output. Any per-case error falls back to the persistence guess (the checkpoint
-close) so a case is still valid instead of crashing the run.
+Standard library only, deterministic, no network, no randomness.
+Reads $MAKEFUN_INPUT_DIR (else /input) and writes
+$MAKEFUN_OUTPUT_DIR (else /output), one <id>.out per <id>.in.
 """
 
 import json
 import math
 import os
+import sys
 from pathlib import Path
 
-INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+# Ridge constants fitted on the practice window (see module docstring).
+FEATURE_MEANS = (
+    -0.000314,  # r60
+    -0.002014,  # r240
+    -0.005456,  # r720
+    -0.009539,  # r1440
+    -0.002494,  # dev720
+    -0.005120,  # dev1440
+    -0.012120,  # dev4320
+)
+FEATURE_SDS = (
+    0.004938,  # r60
+    0.007474,  # r240
+    0.010526,  # r720
+    0.010769,  # r1440
+    0.006422,  # dev720
+    0.007855,  # dev1440
+    0.006697,  # dev4320
+)
+RIDGE_WEIGHTS = (
+    0.000066,   # r60
+    -0.000620,  # r240
+    0.001909,   # r720
+    -0.002742,  # r1440
+    -0.000050,  # dev720
+    -0.000611,  # dev1440
+    -0.001772,  # dev4320
+)
+RIDGE_INTERCEPT = -0.000843
+RIDGE_WEIGHT = 0.7
+COMBO_WEIGHT = 0.3
+CLIP_LOG_RETURN = 0.006
 
-# Smallest positive price on the grid: one unit of its 5 decimals.
-MIN_PRICE = 0.00001
-# Largest grid price below the scorer's exclusive 10,000,000-dollar cap.
-MAX_PRICE = 9_999_999.99999
 
-# Tuned model weights (see module docstring for how they were chosen).
-W_R60 = 0.20      # short-horizon momentum continuation
-W_DEV24 = -0.25   # mean reversion to the 24-hour mean log price
-W_DEV4 = -0.10    # mean reversion to the 4-hour mean log price
-CAP_MULT = 1.5    # clip |pred| to this multiple of realised 240-min volatility
+def log_returns_and_deviations(log_prices):
+    """Return the seven features for the last price in log_prices."""
+    n = len(log_prices)
+    last = log_prices[-1]
 
-# Lookback windows, in minutes.
-N_R60 = 60
-N_DEV24 = 1440
-N_DEV4 = 240
-N_VOL = 240
+    def ret(k):
+        k = min(k, n - 1)
+        return last - log_prices[-1 - k] if k > 0 else 0.0
 
+    def dev(k):
+        k = min(k, n)
+        window = log_prices[n - k:]
+        return last - (sum(window) / len(window))
 
-def price5(x):
-    """x kept on the grid's 5 decimals and inside the scorer's (0, 10,000,000)."""
-    return round(min(MAX_PRICE, max(MIN_PRICE, x)) * 1e5) / 1e5
-
-
-def _mean(xs):
-    return math.fsum(xs) / len(xs)
-
-
-def _pstdev(xs):
-    mu = _mean(xs)
-    return math.sqrt(math.fsum((x - mu) * (x - mu) for x in xs) / len(xs))
+    return (
+        ret(60),
+        ret(240),
+        ret(720),
+        ret(1440),
+        dev(720),
+        dev(1440),
+        dev(4320),
+    )
 
 
-def forecast(prices):
-    """Forecast the price 240 minutes after the last close in `prices`."""
-    if not prices:
-        raise ValueError("no prices in case")
+def ridge_forecast(features):
+    total = RIDGE_INTERCEPT
+    for value, mean, sd, weight in zip(
+        features, FEATURE_MEANS, FEATURE_SDS, RIDGE_WEIGHTS
+    ):
+        total += weight * (value - mean) / sd
+    return total
+
+
+def combo_forecast(features):
+    _r60, r240, _r720, r1440, _dev720, dev1440, _dev4320 = features
+    return -0.07 * r240 - 0.07 * r1440 - 0.10 * dev1440
+
+
+def forecast_price(prices):
+    """Forecast the close 240 minutes after the last price in prices."""
     last = float(prices[-1])
-    if not math.isfinite(last) or last <= 0:
-        raise ValueError("last price is not a positive finite number")
-    if len(prices) < N_DEV24 + 1:
-        # Not enough history for the full model: fall back to persistence.
-        return price5(last)
-
-    logs = [math.log(float(p)) for p in prices]
-    if any(not math.isfinite(v) for v in logs):
-        raise ValueError("non-finite log price")
-
-    r60 = logs[-1] - logs[-1 - N_R60]
-    dev24 = logs[-1] - _mean(logs[-N_DEV24:])
-    dev4 = logs[-1] - _mean(logs[-N_DEV4:])
-
-    # Realised per-minute volatility over the last 240 minutes.
-    diffs = [logs[i + 1] - logs[i] for i in range(len(logs) - N_VOL - 1, len(logs) - 1)]
-    vol240 = _pstdev(diffs) * math.sqrt(N_VOL)
-
-    pred = W_R60 * r60 + W_DEV24 * dev24 + W_DEV4 * dev4
-    cap = CAP_MULT * max(vol240, 1e-4)
-    pred = max(-cap, min(cap, pred))
-
-    return price5(last * math.exp(pred))
+    if len(prices) < 120 or last <= 0.0:
+        return last
+    log_prices = [math.log(float(p)) for p in prices if float(p) > 0.0]
+    if len(log_prices) < 120:
+        return last
+    features = log_returns_and_deviations(log_prices)
+    log_move = RIDGE_WEIGHT * ridge_forecast(features)
+    log_move += COMBO_WEIGHT * combo_forecast(features)
+    log_move = max(-CLIP_LOG_RETURN, min(CLIP_LOG_RETURN, log_move))
+    guess = last * math.exp(log_move)
+    if not (math.isfinite(guess) and 0.0 < guess < 10000000.0):
+        return last
+    return round(guess, 2)
 
 
 def main():
-    input_dir = Path(INPUT_DIR)
-    output_dir = Path(OUTPUT_DIR)
+    input_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR") or "/input")
+    output_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output")
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Every case file, in name order, so two runs write the same bytes.
-    inputs = sorted(p for p in input_dir.iterdir() if p.name.endswith(".in"))
-    for path in inputs:
-        case_id = path.name[: -len(".in")]
-        with path.open("r", encoding="utf-8") as fh:
-            case = json.load(fh)
-        markets = case.get("markets")
-        if not isinstance(markets, list) or len(markets) != 1:
-            raise ValueError(f"{path.name} does not hold exactly one market")
-        prices = markets[0].get("prices")
-        if not isinstance(prices, list) or not prices:
-            raise ValueError(f"{path.name} has no prices")
+    case_files = sorted(input_dir.glob("*.in"))
+    if not case_files:
+        print("no case files found in %s" % input_dir, file=sys.stderr)
+        return 1
+    for case_file in case_files:
+        case_id = case_file.stem
         try:
-            guess = forecast(prices)
-        except Exception:
-            # Never crash a run and never leave a case unwritten: fall back
-            # to the last finite positive close (the persistence guess), and
-            # if the series holds no usable price at all, to a valid number
-            # so the case still counts as valid instead of voiding the entry.
-            guess = None
-            for raw in reversed(prices):
-                try:
-                    v = float(raw)
-                except (TypeError, ValueError):
-                    continue
-                if math.isfinite(v) and v > 0:
-                    guess = price5(v)
-                    break
-            if guess is None:
-                guess = 1.0
-        out = {"forecasts": [{"case": case_id, "price": guess}]}
-        with (output_dir / f"{case_id}.out").open("w", encoding="utf-8") as fh:
-            fh.write(json.dumps(out) + "\n")
+            with open(case_file, "r", encoding="utf-8") as handle:
+                case = json.load(handle)
+            prices = case["markets"][0]["prices"]
+            price = forecast_price(prices)
+        except Exception as exc:  # never crash a case: fall back to last close
+            print("case %s failed (%s); using persistence" % (case_id, exc),
+                  file=sys.stderr)
+            try:
+                with open(case_file, "r", encoding="utf-8") as handle:
+                    case = json.load(handle)
+                price = float(case["markets"][0]["prices"][-1])
+            except Exception:
+                continue
+        out_path = output_dir / ("%s.out" % case_id)
+        payload = {"forecasts": [{"case": case_id, "price": price}]}
+        with open(out_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+            handle.write("\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
